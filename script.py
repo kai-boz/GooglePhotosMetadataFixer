@@ -1,148 +1,288 @@
 import os
-import json
 import shutil
-import piexif
-import subprocess
-from PIL import Image
+import re
+import json
 from datetime import datetime
 
-# Ask for processing mode
-print("Select processing mode:")
-print("1 - Process only images")
-print("2 - Process only videos")
-print("3 - Process both images and videos")
+# Supported media extensions
+MEDIA_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.mp4', '.mov']
 
-while True:
-    choice = input("Enter your choice (1/2/3): ").strip()
-    if choice in ("1", "2", "3"):
-        break
-    print("Invalid choice. Please enter 1, 2, or 3.")
+# Minimum length when truncating for messy filenames
+MIN_TRUNCATE_LENGTH = 3
 
-# Ask for the source folder
-source_folder = input("Enter the source folder path: ").strip()
-updated_folder = os.path.join(source_folder, "updated")  # Folder for updated images/videos
-error_folder = os.path.join(source_folder, "error")  # Folder for unmatched images/videos
+# Log file
+LOG_FILENAME = "media_json_match_log.txt"
 
-# Ensure the folders exist
-os.makedirs(updated_folder, exist_ok=True)
-os.makedirs(error_folder, exist_ok=True)
+def clean_filename(name):
+    """Remove trailing (1), (2), etc., before the extension"""
+    return re.sub(r'\(\d+\)', '', name)
 
-# Dictionary for Dutch-to-English month translation
-MONTHS_DUTCH_TO_EN = {
-    "jan": "Jan", "feb": "Feb", "mrt": "Mar", "apr": "Apr", "mei": "May", "jun": "Jun",
-    "jul": "Jul", "aug": "Aug", "sep": "Sep", "okt": "Oct", "nov": "Nov", "dec": "Dec"
-}
+def base_without_trailing_dots(name):
+    """Remove trailing dots before extension"""
+    return re.sub(r'\.+$', '', name)
 
-# Function to find matching JSON file
-def find_json_for_file(file_name, json_files):
-    """Find the corresponding JSON file for an image or video."""
-    for json_file in json_files:
-        if json_file.startswith(file_name) and json_file.endswith(".json"):
-            return json_file
-    return None
+def scan_folder(folder):
+    """Recursively scan folder and return all files"""
+    files_list = []
+    for root, _, files in os.walk(folder):
+        for file in files:
+            files_list.append(os.path.join(root, file))
+    return files_list
 
-# Function to format EXIF date
-def format_exif_date(date_str):
-    """Convert '22 mei 2023, 13:41:27 UTC' to 'YYYY:MM:DD HH:MM:SS'"""
-    try:
-        for dutch, eng in MONTHS_DUTCH_TO_EN.items():
-            if dutch in date_str.lower():
-                date_str = date_str.lower().replace(dutch, eng)
-                break
-        dt = datetime.strptime(date_str, "%d %b %Y, %H:%M:%S UTC")
-        return dt.strftime("%Y:%m:%d %H:%M:%S")
-    except ValueError:
-        print(f"Error parsing date: {date_str}")
-        return None
+def set_file_time(file_path, timestamp):
+    """Set modified and access time (cross-platform)"""
+    os.utime(file_path, (timestamp, timestamp))
 
-# Function to update image metadata
-def update_image_metadata(image_path, json_data):
-    try:
-        image = Image.open(image_path)
-        exif_dict = piexif.load(image.info.get("exif", b"")) if "exif" in image.info else {"0th": {}, "Exif": {}}
-        exif_dict.setdefault("0th", {})
-        exif_dict.setdefault("Exif", {})
+def main():
+    source_folder = input("Enter the full path of the source folder: ").strip()
+    processed_folder = os.path.join(source_folder, "processed")
+    error_folder = os.path.join(source_folder, "error_files")
+    os.makedirs(processed_folder, exist_ok=True)
+    os.makedirs(error_folder, exist_ok=True)
 
-        # Update ImageDescription
-        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = json_data.get("description", "").encode()
+    # Clear previous log
+    log_path = os.path.join(source_folder, LOG_FILENAME)
+    with open(log_path, 'w', encoding='utf-8') as log_file:
+        log_file.write("Media-JSON Matching Log\n")
+        log_file.write("="*50 + "\n")
 
-        # Convert and set DateTimeOriginal
-        if "photoTakenTime" in json_data and "formatted" in json_data["photoTakenTime"]:
-            formatted_date = format_exif_date(json_data["photoTakenTime"]["formatted"])
-            if formatted_date:
-                exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = formatted_date.encode()
+    all_files = scan_folder(source_folder)
 
-        # Save updated image
-        exif_bytes = piexif.dump(exif_dict)
-        updated_image_path = os.path.join(updated_folder, os.path.basename(image_path))
-        image.save(updated_image_path, exif=exif_bytes)
+    # Separate media and JSON files
+    media_files = [f for f in all_files if os.path.splitext(f)[1].lower() in MEDIA_EXTENSIONS]
+    json_files = [f for f in all_files if f.lower().endswith('.json')]
 
-        print(f"Updated metadata for image: {image_path}")
+    for media_path in media_files:
+        media_name = os.path.basename(media_path)
+        media_dir = os.path.dirname(media_path)
+        media_clean = clean_filename(media_name)
+        name_part, ext = os.path.splitext(media_clean)
+        matched_json = None
 
-    except Exception as e:
-        print(f"Failed to update image {image_path}: {e}")
+        # Step 1: Exact JSON replacement (e.g., 077.json)
+        simple_json_name = os.path.join(media_dir, name_part + '.json')
+        if simple_json_name in json_files:
+            matched_json = simple_json_name
+        else:
+            # Step 2: Standard Takeout JSON (media.jpg.suffix.json)
+            for json_file in json_files:
+                if os.path.basename(json_file).startswith(media_clean + "."):
+                    matched_json = json_file
+                    break
 
-# Function to update video metadata
-def update_video_metadata(video_path, json_data):
-    """Update video metadata using ExifTool."""
-    try:
-        if "photoTakenTime" in json_data and "formatted" in json_data["photoTakenTime"]:
-            formatted_date = format_exif_date(json_data["photoTakenTime"]["formatted"])
+            # Step 3: Progressive truncation for messy filenames
+            if not matched_json:
+                truncated_name = name_part
+                while len(truncated_name) > MIN_TRUNCATE_LENGTH:
+                    for json_file in json_files:
+                        json_base = os.path.splitext(os.path.basename(json_file))[0]
+                        json_base = base_without_trailing_dots(json_base)
+                        if json_base.startswith(truncated_name):
+                            matched_json = json_file
+                            break
+                    if matched_json:
+                        break
+                    truncated_name = truncated_name[:-1]
 
-            if formatted_date:
-                updated_video_path = os.path.join(updated_folder, os.path.basename(video_path))
+        # Determine processed file path
+        rel_path = os.path.relpath(media_dir, source_folder)
+        target_dir = os.path.join(processed_folder, rel_path)
+        os.makedirs(target_dir, exist_ok=True)
+        processed_media_path = os.path.join(target_dir, media_name)
 
-                # Run ExifTool command to set "Media Created"
-                subprocess.run([
-                    "ExifTool",
-                    "-overwrite_original",
-                    f"-MediaCreateDate={formatted_date}",
-                    video_path
-                ], check=True)
+        # Copy file first
+        shutil.copy2(media_path, processed_media_path)
 
-                # Move updated file to the updated folder
-                shutil.move(video_path, updated_video_path)
+        # Logging and timestamp update
+        with open(log_path, 'a', encoding='utf-8') as log_file:
+            if matched_json:
+                log_file.write(f"Found: {media_path}\n")
+                log_file.write(f"Found corresponding JSON file: {matched_json}\n")
 
-                print(f"Updated 'Media Created' metadata for video: {video_path}")
+                # Update timestamp from JSON if possible
+                try:
+                    with open(matched_json, 'r', encoding='utf-8') as jf:
+                        data = json.load(jf)
+                    if 'photoTakenTime' in data and 'timestamp' in data['photoTakenTime']:
+                        ts = int(data['photoTakenTime']['timestamp'])
+                        set_file_time(processed_media_path, ts)
+                        dt_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                        log_file.write(f"Updated timestamp to: {dt_str}\n")
+                        print(f"Updated {media_name} timestamp to {dt_str}")
+                    else:
+                        log_file.write("No photoTakenTime found in JSON.\n")
+                        print(f"No photoTakenTime in JSON for {media_name}")
+                except Exception as e:
+                    log_file.write(f"Error reading JSON for timestamp: {e}\n")
+                    print(f"Error processing JSON for {media_name}: {e}")
 
-    except Exception as e:
-        print(f"Failed to update video {video_path}: {e}")
+                log_file.write("\n")
+                print(f"Found: {media_name}")
+                print(f"Found corresponding JSON file: {os.path.basename(matched_json)}\n")
+            else:
+                log_file.write(f"Exception: no valid JSON file found for {media_path}\n\n")
+                print(f"Found: {media_name}")
+                print(f"Exception: no valid JSON file found for {media_name}")
+                # Move unmatched media to error folder (original files)
+                error_target_dir = os.path.join(error_folder, rel_path)
+                os.makedirs(error_target_dir, exist_ok=True)
+                shutil.move(media_path, os.path.join(error_target_dir, media_name))
 
-# Get all image and video files based on user's choice
-image_extensions = ("jpg", "jpeg", "png", "gif", "bmp", "tiff")
-video_extensions = ("mp4", "mov", "avi", "mkv")
+if __name__ == "__main__":
+    main()
 
-if choice == "1":
-    valid_extensions = image_extensions  # Process only images
-elif choice == "2":
-    valid_extensions = video_extensions  # Process only videos
-else:
-    valid_extensions = image_extensions + video_extensions  # Process both
+import os
+import shutil
+import re
+import json
+from datetime import datetime
+import sys
 
-all_files = [f for f in os.listdir(source_folder) if f.lower().endswith(valid_extensions)]
-json_files = [f for f in os.listdir(source_folder) if f.lower().endswith(".json")]
+# Supported media extensions
+MEDIA_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.mp4', '.mov']
 
-# Process each file
-for file in all_files:
-    file_name = os.path.splitext(file)[0]
-    json_file = find_json_for_file(file_name, json_files)
+# Minimum length when truncating for messy filenames
+MIN_TRUNCATE_LENGTH = 3
 
-    file_path = os.path.join(source_folder, file)
+# Log file
+LOG_FILENAME = "media_json_match_log.txt"
 
-    if json_file:
-        json_path = os.path.join(source_folder, json_file)
+def clean_filename(name):
+    """Remove trailing (1), (2), etc., before the extension"""
+    return re.sub(r'\(\d+\)', '', name)
 
-        with open(json_path, "r", encoding="utf-8") as f:
-            json_data = json.load(f)
+def base_without_trailing_dots(name):
+    """Remove trailing dots before extension"""
+    return re.sub(r'\.+$', '', name)
 
-        if file.lower().endswith(image_extensions):
-            update_image_metadata(file_path, json_data)
-        elif file.lower().endswith(video_extensions):
-            update_video_metadata(file_path, json_data)
-    else:
-        # Move unmatched files to error folder
-        error_path = os.path.join(error_folder, file)
-        shutil.move(file_path, error_path)
-        print(f"Moved {file} to error folder (No matching JSON found)")
+def scan_folder(folder):
+    """Recursively scan folder and return all files"""
+    files_list = []
+    for root, _, files in os.walk(folder):
+        for file in files:
+            files_list.append(os.path.join(root, file))
+    return files_list
 
-print("Processing complete.")
+def set_file_time(file_path, timestamp):
+    """
+    Set modified, access, and creation time.
+    On Windows, creation time is updated using pywin32.
+    """
+    # Set access & modified time
+    os.utime(file_path, (timestamp, timestamp))
+
+    # Set creation time on Windows
+    if sys.platform == 'win32':
+        try:
+            import pywintypes
+            import win32file
+            import win32con
+
+            file_handle = win32file.CreateFile(
+                file_path, win32con.GENERIC_WRITE,
+                0, None, win32con.OPEN_EXISTING,
+                win32con.FILE_ATTRIBUTE_NORMAL, None
+            )
+            pytime = pywintypes.Time(timestamp)
+            win32file.SetFileTime(file_handle, pytime, pytime, pytime)
+            file_handle.close()
+        except ImportError:
+            print("pywin32 not installed, creation time not updated on Windows.")
+        except Exception as e:
+            print(f"Failed to update creation time for {file_path}: {e}")
+
+def main():
+    source_folder = input("Enter the full path of the source folder: ").strip()
+    processed_folder = os.path.join(source_folder, "processed")
+    error_folder = os.path.join(source_folder, "error_files")
+    os.makedirs(processed_folder, exist_ok=True)
+    os.makedirs(error_folder, exist_ok=True)
+
+    # Clear previous log
+    log_path = os.path.join(source_folder, LOG_FILENAME)
+    with open(log_path, 'w', encoding='utf-8') as log_file:
+        log_file.write("Media-JSON Matching Log\n")
+        log_file.write("="*50 + "\n")
+
+    all_files = scan_folder(source_folder)
+
+    # Separate media and JSON files
+    media_files = [f for f in all_files if os.path.splitext(f)[1].lower() in MEDIA_EXTENSIONS]
+    json_files = [f for f in all_files if f.lower().endswith('.json')]
+
+    for media_path in media_files:
+        media_name = os.path.basename(media_path)
+        media_dir = os.path.dirname(media_path)
+        media_clean = clean_filename(media_name)
+        name_part, ext = os.path.splitext(media_clean)
+        matched_json = None
+
+        # Step 1: Exact JSON replacement (e.g., 077.json)
+        simple_json_name = os.path.join(media_dir, name_part + '.json')
+        if simple_json_name in json_files:
+            matched_json = simple_json_name
+        else:
+            # Step 2: Standard Takeout JSON (media.jpg.suffix.json)
+            for json_file in json_files:
+                if os.path.basename(json_file).startswith(media_clean + "."):
+                    matched_json = json_file
+                    break
+
+            # Step 3: Progressive truncation for messy filenames
+            if not matched_json:
+                truncated_name = name_part
+                while len(truncated_name) > MIN_TRUNCATE_LENGTH:
+                    for json_file in json_files:
+                        json_base = os.path.splitext(os.path.basename(json_file))[0]
+                        json_base = base_without_trailing_dots(json_base)
+                        if json_base.startswith(truncated_name):
+                            matched_json = json_file
+                            break
+                    if matched_json:
+                        break
+                    truncated_name = truncated_name[:-1]
+
+        # Determine processed file path
+        rel_path = os.path.relpath(media_dir, source_folder)
+        target_dir = os.path.join(processed_folder, rel_path)
+        os.makedirs(target_dir, exist_ok=True)
+        processed_media_path = os.path.join(target_dir, media_name)
+
+        # Copy file first
+        shutil.copy2(media_path, processed_media_path)
+
+        # Logging and timestamp update
+        with open(log_path, 'a', encoding='utf-8') as log_file:
+            if matched_json:
+                log_file.write(f"Found: {media_path}\n")
+                log_file.write(f"Found corresponding JSON file: {matched_json}\n")
+
+                # Update timestamp from JSON if possible
+                try:
+                    with open(matched_json, 'r', encoding='utf-8') as jf:
+                        data = json.load(jf)
+                    if 'photoTakenTime' in data and 'timestamp' in data['photoTakenTime']:
+                        ts = int(data['photoTakenTime']['timestamp'])
+                        set_file_time(processed_media_path, ts)
+                        dt_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                        log_file.write(f"Updated timestamp to: {dt_str}\n")
+                        print(f"Updated {media_name} timestamps to {dt_str}")
+                    else:
+                        log_file.write("No photoTakenTime found in JSON.\n")
+                        print(f"No photoTakenTime in JSON for {media_name}")
+                except Exception as e:
+                    log_file.write(f"Error reading JSON for timestamp: {e}\n")
+                    print(f"Error processing JSON for {media_name}: {e}")
+
+                log_file.write("\n")
+            else:
+                log_file.write(f"Exception: no valid JSON file found for {media_path}\n\n")
+                print(f"Exception: no valid JSON file found for {media_name}")
+                # Move unmatched media to error folder (original files)
+                error_target_dir = os.path.join(error_folder, rel_path)
+                os.makedirs(error_target_dir, exist_ok=True)
+                shutil.move(media_path, os.path.join(error_target_dir, media_name))
+
+if __name__ == "__main__":
+    main()
+
